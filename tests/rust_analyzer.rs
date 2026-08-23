@@ -1,10 +1,9 @@
 use std::path::Path;
 
-use async_lsp::lsp_types::SymbolKind;
 use petgraph::graph::NodeIndex;
-use plexus::graph::{Graph, Relation, mutates};
+use plexus::graph::{Graph, NodeKind, Relation, mutates};
 
-fn node(graph: &Graph, name: &str, kind: SymbolKind) -> NodeIndex {
+fn node(graph: &Graph, name: &str, kind: NodeKind) -> NodeIndex {
     graph
         .node_indices()
         .find(|&node| graph[node].name == name && graph[node].kind == kind)
@@ -25,11 +24,11 @@ async fn extracts_program_relationships() {
         .await
         .unwrap();
 
-    let counter = node(&graph, "Counter", SymbolKind::STRUCT);
-    let field = node(&graph, "value", SymbolKind::FIELD);
-    let increment = node(&graph, "increment", SymbolKind::METHOD);
-    let value = node(&graph, "value", SymbolKind::METHOD);
-    let tick = node(&graph, "tick", SymbolKind::FUNCTION);
+    let counter = node(&graph, "Counter", NodeKind::Struct);
+    let field = node(&graph, "value", NodeKind::Field);
+    let increment = node(&graph, "increment", NodeKind::Method);
+    let value = node(&graph, "value", NodeKind::Method);
+    let tick = node(&graph, "tick", NodeKind::Function);
 
     assert!(relates(&graph, counter, field, Relation::Contains));
     assert!(

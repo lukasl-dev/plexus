@@ -5,6 +5,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_lsp::lsp_types::request::{
+    CallHierarchyOutgoingCalls, DocumentHighlightRequest, References, Request,
+};
 use async_lsp::lsp_types::{
     CallHierarchyItem, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     CallHierarchyServerCapability, DidOpenTextDocumentParams, DocumentHighlightKind,
@@ -16,7 +19,7 @@ use async_lsp::lsp_types::{
 use async_lsp::{Error as LspError, ErrorCode, LanguageServer, ServerSocket};
 use petgraph::graph::NodeIndex;
 
-use crate::graph::{Graph, Node, Relation};
+use crate::graph::{Graph, Node, NodeKind, Relation};
 use crate::lsp::Session;
 
 const READY_ATTEMPTS: usize = 20;
@@ -87,6 +90,7 @@ async fn extract(session: &mut Session, documents: &[TextDocumentItem]) -> Resul
             })
             .with_context(|| format!("cannot open {} through LSP", document.uri))?;
     }
+    session.wait_until_idle().await?;
 
     let mut workspace = WorkspaceGraph::default();
     for document in documents {
@@ -127,7 +131,7 @@ impl WorkspaceGraph {
                 .and_then(Iterator::last)
                 .unwrap_or(document.uri.path())
                 .to_owned(),
-            kind: SymbolKind::FILE,
+            kind: NodeKind::File,
             location,
         });
         self.files.insert(document.uri.clone(), node);
@@ -169,7 +173,7 @@ impl WorkspaceGraph {
                     selection.clone(),
                     Node {
                         name: symbol.name,
-                        kind: symbol.kind,
+                        kind: symbol.kind.into(),
                         location,
                     },
                 );
@@ -200,7 +204,7 @@ impl WorkspaceGraph {
         let mut definitions = self.callables.clone();
         if let Some(readiness_probe) = definitions.iter().position(|definition| {
             let kind = self.graph[definition.node].kind;
-            kind == SymbolKind::FUNCTION || kind == SymbolKind::METHOD
+            kind == NodeKind::Function || kind == NodeKind::Method
         }) {
             definitions.swap(0, readiness_probe);
         }
@@ -234,15 +238,17 @@ impl WorkspaceGraph {
         }
 
         for (caller, item) in items {
-            let calls = server
-                .outgoing_calls(CallHierarchyOutgoingCallsParams {
+            let calls = retry_request::<CallHierarchyOutgoingCalls>(
+                server,
+                &CallHierarchyOutgoingCallsParams {
                     item,
                     work_done_progress_params: WorkDoneProgressParams::default(),
                     partial_result_params: PartialResultParams::default(),
-                })
-                .await
-                .context("cannot read outgoing calls")?
-                .unwrap_or_default();
+                },
+            )
+            .await
+            .context("cannot read outgoing calls")?
+            .unwrap_or_default();
             for call in calls {
                 let callee = self.intern_call_item(&call.to);
                 self.add_relation(caller, callee, Relation::Calls);
@@ -254,25 +260,27 @@ impl WorkspaceGraph {
 
     async fn add_state_accesses(&mut self, server: &mut ServerSocket) -> Result<()> {
         for state in self.state_symbols.clone() {
-            let references = server
-                .references(ReferenceParams {
+            let references = retry_request::<References>(
+                server,
+                &ReferenceParams {
                     text_document_position: at(&state.selection),
                     work_done_progress_params: WorkDoneProgressParams::default(),
                     partial_result_params: PartialResultParams::default(),
                     context: ReferenceContext {
                         include_declaration: false,
                     },
-                })
-                .await
-                .with_context(|| {
-                    format!(
-                        "cannot read references to {}:{}:{}",
-                        state.selection.uri,
-                        state.selection.range.start.line,
-                        state.selection.range.start.character
-                    )
-                })?
-                .unwrap_or_default();
+                },
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot read references to {}:{}:{}",
+                    state.selection.uri,
+                    state.selection.range.start.line,
+                    state.selection.range.start.character
+                )
+            })?
+            .unwrap_or_default();
 
             let mut references_by_document: HashMap<_, HashSet<_>> = HashMap::new();
             for reference in references {
@@ -290,18 +298,20 @@ impl WorkspaceGraph {
                     .next()
                     .expect("documents are inserted with at least one reference")
                     .start;
-                let highlights = server
-                    .document_highlight(DocumentHighlightParams {
+                let highlights = retry_request::<DocumentHighlightRequest>(
+                    server,
+                    &DocumentHighlightParams {
                         text_document_position_params: TextDocumentPositionParams {
                             text_document: TextDocumentIdentifier { uri: uri.clone() },
                             position,
                         },
                         work_done_progress_params: WorkDoneProgressParams::default(),
                         partial_result_params: PartialResultParams::default(),
-                    })
-                    .await
-                    .with_context(|| format!("cannot classify accesses in {uri}"))?
-                    .unwrap_or_default();
+                    },
+                )
+                .await
+                .with_context(|| format!("cannot classify accesses in {uri}"))?
+                .unwrap_or_default();
 
                 for highlight in highlights {
                     if !references.contains(&highlight.range) {
@@ -336,7 +346,7 @@ impl WorkspaceGraph {
             item_selection(item),
             Node {
                 name: item.name.clone(),
-                kind: item.kind,
+                kind: item.kind.into(),
                 location: Location::new(item.uri.clone(), item.range),
             },
         )
@@ -412,7 +422,16 @@ fn read_documents(root: &Path, language: &str, extension: &str) -> Result<Vec<Te
 fn ignored_directory(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(OsStr::to_str),
-        Some(".git" | ".hg" | ".svn" | "node_modules" | "target")
+        Some(
+            ".git"
+                | ".hg"
+                | ".svn"
+                | ".zig-cache"
+                | "node_modules"
+                | "target"
+                | "zig-cache"
+                | "zig-out"
+        )
     )
 }
 
@@ -486,6 +505,24 @@ async fn prepare_call_hierarchy(
             {
                 tokio::time::sleep(READY_RETRY_DELAY).await;
             }
+            Err(LspError::Response(error))
+                if error.code == ErrorCode::CONTENT_MODIFIED && attempt + 1 < READY_ATTEMPTS =>
+            {
+                tokio::time::sleep(READY_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
+}
+
+async fn retry_request<R>(server: &ServerSocket, params: &R::Params) -> async_lsp::Result<R::Result>
+where
+    R: Request,
+    R::Params: Clone,
+{
+    for attempt in 0..READY_ATTEMPTS {
+        match server.request::<R>(params.clone()).await {
             Err(LspError::Response(error))
                 if error.code == ErrorCode::CONTENT_MODIFIED && attempt + 1 < READY_ATTEMPTS =>
             {

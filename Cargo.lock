@@ -691,6 +691,8 @@ dependencies = [
  "async-process",
  "clap",
  "petgraph",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
