@@ -1,11 +1,11 @@
 mod compact;
 mod json;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_lsp::lsp_types::{Range, Url};
 use petgraph::visit::EdgeRef;
 use serde::Serialize;
@@ -39,9 +39,22 @@ pub(super) struct ExportEdge {
 }
 
 impl<'a> Snapshot<'a> {
-    pub fn new(graph: &'a Graph) -> Self {
+    pub fn new(graph: &'a Graph) -> Result<Self> {
         let mut indices: Vec<_> = graph.node_indices().collect();
         indices.sort_by(|&left, &right| compare_nodes(&graph[left], &graph[right]));
+        if let Some(nodes) = indices
+            .windows(2)
+            .find(|nodes| compare_nodes(&graph[nodes[0]], &graph[nodes[1]]).is_eq())
+        {
+            let node = &graph[nodes[0]];
+            bail!(
+                "nodes with name {:?}, kind {}, and location {} {:?} have no stable distinguishing identity",
+                node.name,
+                node.kind,
+                node.location.uri,
+                node.location.range
+            );
+        }
         let ids: HashMap<_, _> = indices
             .iter()
             .enumerate()
@@ -55,7 +68,7 @@ impl<'a> Snapshot<'a> {
         files.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         files.dedup();
 
-        let nodes = indices
+        let nodes: Vec<_> = indices
             .iter()
             .enumerate()
             .map(|(id, &index)| {
@@ -78,13 +91,70 @@ impl<'a> Snapshot<'a> {
             })
             .collect();
         edges.sort_by_key(|edge| (edge.source, edge.relation, edge.target));
+        validate_containment(&nodes, &edges)?;
 
-        Self {
+        Ok(Self {
             files,
             nodes,
             edges,
+        })
+    }
+}
+
+fn validate_containment(nodes: &[ExportNode<'_>], edges: &[ExportEdge]) -> Result<()> {
+    let mut file_nodes = HashMap::new();
+    for node in nodes {
+        if node.kind == NodeKind::File
+            && let Some(previous) = file_nodes.insert(node.file, node.id)
+        {
+            bail!(
+                "file {} has multiple file nodes: {} and {}",
+                node.file,
+                previous,
+                node.id
+            );
         }
     }
+
+    let mut parents = HashMap::new();
+    for edge in edges {
+        if edge.relation != Relation::Contains {
+            continue;
+        }
+        if nodes[edge.source].file != nodes[edge.target].file {
+            bail!(
+                "containment relationship {} -> {} crosses files",
+                edge.source,
+                edge.target
+            );
+        }
+        if nodes[edge.target].kind == NodeKind::File {
+            bail!("file node {} has a containment parent", edge.target);
+        }
+        if let Some(parent) = parents.insert(edge.target, edge.source)
+            && parent != edge.source
+        {
+            bail!(
+                "node {} has multiple containment parents: {} and {}",
+                edge.target,
+                parent,
+                edge.source
+            );
+        }
+    }
+
+    for &child in parents.keys() {
+        let mut ancestors = HashSet::new();
+        let mut current = child;
+        while let Some(&parent) = parents.get(&current) {
+            if !ancestors.insert(current) {
+                bail!("containment relationship involving node {child} is cyclic");
+            }
+            current = parent;
+        }
+    }
+
+    Ok(())
 }
 
 pub fn write_summary(graph: &Graph, mut output: impl Write) -> Result<()> {
@@ -131,27 +201,47 @@ fn compare_nodes(left: &Node, right: &Node) -> std::cmp::Ordering {
 
 #[cfg(test)]
 pub(super) fn test_graph() -> (Graph, PathBuf) {
+    test_graph_in_order([0, 1, 2, 3, 4])
+}
+
+#[cfg(test)]
+pub(super) fn reversed_test_graph() -> (Graph, PathBuf) {
+    test_graph_in_order([4, 3, 2, 1, 0])
+}
+
+#[cfg(test)]
+fn test_graph_in_order(order: [usize; 5]) -> (Graph, PathBuf) {
     use async_lsp::lsp_types::{Location, Position};
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).to_owned();
     let uri = Url::from_file_path(root.join("src/example.rs")).unwrap();
     let mut graph = Graph::new();
-    let mut node = |kind: NodeKind, name: &str, start: u32, end: u32| {
-        graph.add_node(crate::graph::Node {
+    let nodes = [
+        (NodeKind::Function, "run", 7, 9),
+        (NodeKind::Method, "increment", 3, 5),
+        (NodeKind::Field, "value", 2, 2),
+        (NodeKind::Struct, "Counter", 1, 6),
+        (NodeKind::File, "example.rs", 0, 10),
+    ];
+    let mut indices = HashMap::new();
+    for id in order {
+        let (kind, name, start, end) = nodes[id];
+        let index = graph.add_node(crate::graph::Node {
             name: name.into(),
             kind,
             location: Location::new(
                 uri.clone(),
                 Range::new(Position::new(start, 0), Position::new(end, 0)),
             ),
-        })
-    };
+        });
+        indices.insert(id, index);
+    }
 
-    let function = node(NodeKind::Function, "run", 7, 9);
-    let method = node(NodeKind::Method, "increment", 3, 5);
-    let field = node(NodeKind::Field, "value", 2, 2);
-    let structure = node(NodeKind::Struct, "Counter", 1, 6);
-    let file = node(NodeKind::File, "example.rs", 0, 10);
+    let function = indices[&0];
+    let method = indices[&1];
+    let field = indices[&2];
+    let structure = indices[&3];
+    let file = indices[&4];
     graph.add_edge(file, structure, Relation::Contains);
     graph.add_edge(structure, field, Relation::Contains);
     graph.add_edge(structure, method, Relation::Contains);

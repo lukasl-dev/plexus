@@ -48,7 +48,7 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
-    pub const fn name(self) -> Option<&'static str> {
+    pub const fn as_str(self) -> Option<&'static str> {
         match self {
             Self::File => Some("file"),
             Self::Module => Some("module"),
@@ -111,6 +111,7 @@ impl From<SymbolKind> for NodeKind {
             SymbolKind::OPERATOR => Self::Operator,
             SymbolKind::TYPE_PARAMETER => Self::TypeParameter,
             kind => {
+                // lsp-types keeps the integer private; Serde is its public lossless form.
                 let code = serde_json::to_value(kind)
                     .expect("SymbolKind serializes as an integer")
                     .as_i64()
@@ -126,7 +127,7 @@ impl fmt::Display for NodeKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unknown(code) => write!(formatter, "unknown:{code}"),
-            kind => formatter.write_str(kind.name().expect("known kinds have names")),
+            kind => formatter.write_str(kind.as_str().expect("known kinds have names")),
         }
     }
 }
@@ -138,13 +139,12 @@ impl Serialize for NodeKind {
     {
         match self {
             Self::Unknown(code) => serializer.serialize_i32(*code),
-            kind => serializer.serialize_str(kind.name().expect("known kinds have names")),
+            kind => serializer.serialize_str(kind.as_str().expect("known kinds have names")),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Relation {
     Contains,
     Calls,
@@ -152,8 +152,17 @@ pub enum Relation {
     Writes,
 }
 
+impl Serialize for Relation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 impl Relation {
-    pub const fn name(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Contains => "contains",
             Self::Calls => "calls",
@@ -193,6 +202,18 @@ pub fn mutates(graph: &Graph, function: NodeIndex, r#type: NodeIndex) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_lsp::lsp_types::{Position, Range, Url};
+
+    fn node(graph: &mut Graph, name: &str, kind: NodeKind) -> NodeIndex {
+        graph.add_node(Node {
+            name: name.into(),
+            kind,
+            location: Location::new(
+                Url::parse("file:///test.rs").unwrap(),
+                Range::new(Position::new(0, 0), Position::new(1, 0)),
+            ),
+        })
+    }
 
     #[test]
     fn preserves_unknown_lsp_symbol_kinds() {
@@ -202,5 +223,27 @@ mod tests {
         assert_eq!(kind, NodeKind::Unknown(99));
         assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(99));
         assert_eq!(kind.to_string(), "unknown:99");
+    }
+
+    #[test]
+    fn derives_mutation_through_calls_and_terminates_on_cycles() {
+        let mut graph = Graph::new();
+        let structure = node(&mut graph, "State", NodeKind::Struct);
+        let other_structure = node(&mut graph, "Other", NodeKind::Struct);
+        let field = node(&mut graph, "value", NodeKind::Field);
+        let caller = node(&mut graph, "caller", NodeKind::Function);
+        let callee = node(&mut graph, "callee", NodeKind::Function);
+        let observer = node(&mut graph, "observer", NodeKind::Function);
+
+        graph.add_edge(structure, field, Relation::Contains);
+        graph.add_edge(caller, callee, Relation::Calls);
+        graph.add_edge(callee, caller, Relation::Calls);
+        graph.add_edge(callee, field, Relation::Writes);
+        graph.add_edge(observer, observer, Relation::Calls);
+
+        assert!(mutates(&graph, caller, structure));
+        assert!(mutates(&graph, callee, structure));
+        assert!(!mutates(&graph, caller, other_structure));
+        assert!(!mutates(&graph, observer, structure));
     }
 }

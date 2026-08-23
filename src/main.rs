@@ -42,15 +42,11 @@ enum Format {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(error) = run().await {
-        let broken_pipe = error
-            .downcast_ref::<serde_json::Error>()
-            .and_then(serde_json::Error::io_error_kind)
-            == Some(io::ErrorKind::BrokenPipe)
-            || error.chain().any(|cause| {
-                cause
-                    .downcast_ref::<io::Error>()
-                    .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
-            });
+        let broken_pipe = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+        });
         if broken_pipe {
             return;
         }

@@ -9,7 +9,7 @@ use async_lsp::lsp_types::notification::Progress;
 use async_lsp::lsp_types::request::WorkDoneProgressCreate;
 use async_lsp::lsp_types::{
     ClientCapabilities, ClientInfo, DocumentSymbolClientCapabilities, InitializeParams,
-    InitializedParams, NumberOrString, ProgressParamsValue, ServerCapabilities,
+    InitializedParams, NumberOrString, ProgressParams, ProgressParamsValue, ServerCapabilities,
     TextDocumentClientCapabilities, Url, WindowClientCapabilities, WorkDoneProgress,
     WorkspaceFolder,
 };
@@ -21,9 +21,30 @@ use tokio::task::JoinHandle;
 
 struct Stop;
 
+const PROGRESS_QUIET_PERIOD: Duration = Duration::from_millis(100);
+const PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct ClientState {
     active_progress: Vec<NumberOrString>,
     progress: watch::Sender<usize>,
+}
+
+impl ClientState {
+    fn update_progress(&mut self, progress: ProgressParams) {
+        match progress.value {
+            ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(_)) => {
+                if !self.active_progress.contains(&progress.token) {
+                    self.active_progress.push(progress.token);
+                }
+            }
+            ProgressParamsValue::WorkDone(WorkDoneProgress::End(_)) => {
+                self.active_progress
+                    .retain(|token| token != &progress.token);
+            }
+            ProgressParamsValue::WorkDone(WorkDoneProgress::Report(_)) => {}
+        }
+        self.progress.send_replace(self.active_progress.len());
+    }
 }
 
 pub(crate) struct Session {
@@ -47,20 +68,7 @@ impl Session {
             router
                 .request::<WorkDoneProgressCreate, _>(|_, _| async { Ok(()) })
                 .notification::<Progress>(|state, progress| {
-                    match progress.value {
-                        ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(_)) => {
-                            if !state.active_progress.contains(&progress.token) {
-                                state.active_progress.push(progress.token);
-                            }
-                        }
-                        ProgressParamsValue::WorkDone(WorkDoneProgress::End(_)) => {
-                            state
-                                .active_progress
-                                .retain(|token| token != &progress.token);
-                        }
-                        ProgressParamsValue::WorkDone(WorkDoneProgress::Report(_)) => {}
-                    }
-                    state.progress.send_replace(state.active_progress.len());
+                    state.update_progress(progress);
                     ControlFlow::Continue(())
                 })
                 .event(|_, _: Stop| ControlFlow::Break(Ok(())))
@@ -138,14 +146,17 @@ impl Session {
     }
 
     pub async fn wait_until_idle(&mut self) -> Result<()> {
-        let deadline = tokio::time::sleep(Duration::from_secs(30));
+        let deadline = tokio::time::sleep(PROGRESS_TIMEOUT);
         tokio::pin!(deadline);
 
         loop {
             tokio::select! {
-                () = &mut deadline => bail!("language server remained busy for 30 seconds"),
+                () = &mut deadline => bail!(
+                    "language server remained busy for {} seconds",
+                    PROGRESS_TIMEOUT.as_secs()
+                ),
                 changed = tokio::time::timeout(
-                    Duration::from_millis(100),
+                    PROGRESS_QUIET_PERIOD,
                     self.progress.changed(),
                 ) => match changed {
                     Ok(Ok(())) => {}

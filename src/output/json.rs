@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
@@ -38,7 +38,7 @@ pub fn write_json(graph: &Graph, root: &Path, mut output: impl Write) -> Result<
     let root = canonical_root(root)?;
     let root = Url::from_directory_path(&root)
         .map_err(|()| anyhow!("cannot convert {} to a file URI", root.display()))?;
-    let snapshot = Snapshot::new(graph);
+    let snapshot = Snapshot::new(graph)?;
     let nodes = snapshot
         .nodes
         .iter()
@@ -68,7 +68,7 @@ pub fn write_json(graph: &Graph, root: &Path, mut output: impl Write) -> Result<
         edges: &snapshot.edges,
     };
 
-    serde_json::to_writer_pretty(&mut output, &document)?;
+    serde_json::to_writer_pretty(&mut output, &document).map_err(io::Error::from)?;
     writeln!(output)?;
     Ok(())
 }
@@ -77,12 +77,16 @@ pub fn write_json(graph: &Graph, root: &Path, mut output: impl Write) -> Result<
 mod tests {
     use super::*;
 
+    fn render(graph: &Graph, root: &Path) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_json(graph, root, &mut output).unwrap();
+        output
+    }
+
     #[test]
     fn writes_canonical_json() {
         let (graph, root) = super::super::test_graph();
-        let mut output = Vec::new();
-        write_json(&graph, &root, &mut output).unwrap();
-
+        let output = render(&graph, &root);
         let document: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(document["schema"], SCHEMA);
         assert_eq!(document["positions"]["encoding"], "utf-16");
@@ -94,6 +98,49 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|edge| edge["relation"] == "calls")
+        );
+    }
+
+    #[test]
+    fn output_does_not_depend_on_graph_insertion_order() {
+        let (graph, root) = super::super::test_graph();
+        let (reversed, reversed_root) = super::super::reversed_test_graph();
+
+        assert_eq!(render(&graph, &root), render(&reversed, &reversed_root));
+    }
+
+    #[test]
+    fn preserves_unknown_node_kinds() {
+        let (mut graph, root) = super::super::test_graph();
+        let node = graph.node_indices().next().unwrap();
+        graph[node].kind = NodeKind::Unknown(99);
+
+        let document: serde_json::Value = serde_json::from_slice(&render(&graph, &root)).unwrap();
+        assert!(
+            document["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["kind"] == 99)
+        );
+    }
+
+    #[test]
+    fn rejects_nodes_without_a_stable_distinguishing_identity() {
+        let (mut graph, root) = super::super::test_graph();
+        let original = graph.node_indices().next().unwrap();
+        graph.add_node(crate::graph::Node {
+            name: graph[original].name.clone(),
+            kind: graph[original].kind,
+            location: graph[original].location.clone(),
+        });
+
+        let mut output = Vec::new();
+        let error = write_json(&graph, &root, &mut output).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no stable distinguishing identity")
         );
     }
 }

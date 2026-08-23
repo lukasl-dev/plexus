@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_lsp::lsp_types::request::{
-    CallHierarchyOutgoingCalls, DocumentHighlightRequest, References, Request,
+    CallHierarchyOutgoingCalls, CallHierarchyPrepare, DocumentHighlightRequest, References, Request,
 };
 use async_lsp::lsp_types::{
     CallHierarchyItem, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
@@ -17,7 +17,9 @@ use async_lsp::lsp_types::{
     WorkDoneProgressParams,
 };
 use async_lsp::{Error as LspError, ErrorCode, LanguageServer, ServerSocket};
+use petgraph::Direction;
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 
 use crate::graph::{Graph, Node, NodeKind, Relation};
 use crate::lsp::Session;
@@ -144,8 +146,7 @@ impl WorkspaceGraph {
 
         match response {
             DocumentSymbolResponse::Nested(symbols) => {
-                self.add_nested_symbols(uri, self.files[uri], false, symbols);
-                Ok(())
+                self.add_nested_symbols(uri, self.files[uri], false, symbols)
             }
             DocumentSymbolResponse::Flat(symbols) if symbols.is_empty() => Ok(()),
             DocumentSymbolResponse::Flat(_) => bail!(
@@ -160,7 +161,7 @@ impl WorkspaceGraph {
         parent: NodeIndex,
         inside_callable: bool,
         symbols: Vec<DocumentSymbol>,
-    ) {
+    ) -> Result<()> {
         for symbol in symbols {
             let callable = is_callable(symbol.kind);
             let local = inside_callable && is_state(symbol.kind) && !is_field(symbol.kind);
@@ -169,15 +170,15 @@ impl WorkspaceGraph {
             } else {
                 let location = Location::new(uri.clone(), symbol.range);
                 let selection = Location::new(uri.clone(), symbol.selection_range);
-                let node = self.intern(
+                let node = self.add_symbol(
                     selection.clone(),
                     Node {
                         name: symbol.name,
                         kind: symbol.kind.into(),
                         location,
                     },
-                );
-                self.add_relation(parent, node, Relation::Contains);
+                )?;
+                self.add_relation(parent, node, Relation::Contains)?;
 
                 if callable {
                     self.callables.push(IndexedSymbol {
@@ -195,18 +196,21 @@ impl WorkspaceGraph {
             };
 
             if let Some(children) = symbol.children {
-                self.add_nested_symbols(uri, next_parent, inside_callable || callable, children);
+                self.add_nested_symbols(uri, next_parent, inside_callable || callable, children)?;
             }
         }
+        Ok(())
     }
 
     async fn add_calls(&mut self, server: &mut ServerSocket) -> Result<()> {
         let mut definitions = self.callables.clone();
-        if let Some(readiness_probe) = definitions.iter().position(|definition| {
-            let kind = self.graph[definition.node].kind;
-            kind == NodeKind::Function || kind == NodeKind::Method
+        if let Some(probe) = definitions.iter().position(|definition| {
+            matches!(
+                self.graph[definition.node].kind,
+                NodeKind::Function | NodeKind::Method
+            )
         }) {
-            definitions.swap(0, readiness_probe);
+            definitions.swap(0, probe);
         }
 
         let mut items = Vec::new();
@@ -216,17 +220,23 @@ impl WorkspaceGraph {
                 text_document_position_params: at(&definition.selection),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             };
-            let callables = prepare_call_hierarchy(server, &params, index == 0)
-                .await
-                .with_context(|| {
-                    format!(
-                        "cannot prepare call hierarchy at {}:{}:{}",
-                        definition.selection.uri,
-                        definition.selection.range.start.line,
-                        definition.selection.range.start.character
-                    )
-                })?
-                .unwrap_or_default();
+            // Servers without work-done progress can advertise call hierarchy before their
+            // index is queryable. One known callable forms a semantic readiness barrier;
+            // empty responses for subsequent definitions are then ordinary results.
+            let callables = if index == 0 {
+                wait_for_call_hierarchy(server, &params).await
+            } else {
+                retry_request::<CallHierarchyPrepare>(server, &params).await
+            }
+            .with_context(|| {
+                format!(
+                    "cannot prepare call hierarchy at {}:{}:{}",
+                    definition.selection.uri,
+                    definition.selection.range.start.line,
+                    definition.selection.range.start.character
+                )
+            })?
+            .unwrap_or_default();
 
             for item in callables {
                 let selection = item_selection(&item);
@@ -251,7 +261,7 @@ impl WorkspaceGraph {
             .unwrap_or_default();
             for call in calls {
                 let callee = self.intern_call_item(&call.to);
-                self.add_relation(caller, callee, Relation::Calls);
+                self.add_relation(caller, callee, Relation::Calls)?;
             }
         }
 
@@ -323,7 +333,7 @@ impl WorkspaceGraph {
                         _ => continue,
                     };
                     if let Some(source) = self.enclosing_unit(&uri, highlight.range.start) {
-                        self.add_relation(source, state.node, relation);
+                        self.add_relation(source, state.node, relation)?;
                     }
                 }
             }
@@ -332,27 +342,90 @@ impl WorkspaceGraph {
         Ok(())
     }
 
-    fn intern(&mut self, selection: Location, node: Node) -> NodeIndex {
-        if let Some(&node) = self.symbols_by_selection.get(&selection) {
-            return node;
+    fn add_symbol(&mut self, selection: Location, node: Node) -> Result<NodeIndex> {
+        if let Some(&existing) = self.symbols_by_selection.get(&selection) {
+            bail!(
+                "symbols {:?} and {:?} share selection {}:{}:{}",
+                self.graph[existing].name,
+                node.name,
+                selection.uri,
+                selection.range.start.line,
+                selection.range.start.character
+            );
         }
         let index = self.graph.add_node(node);
         self.symbols_by_selection.insert(selection, index);
-        index
+        Ok(index)
     }
 
     fn intern_call_item(&mut self, item: &CallHierarchyItem) -> NodeIndex {
-        self.intern(
-            item_selection(item),
-            Node {
-                name: item.name.clone(),
-                kind: item.kind.into(),
-                location: Location::new(item.uri.clone(), item.range),
-            },
-        )
+        let selection = item_selection(item);
+        if let Some(&node) = self.symbols_by_selection.get(&selection) {
+            return node;
+        }
+        let node = self.graph.add_node(Node {
+            name: item.name.clone(),
+            kind: item.kind.into(),
+            location: Location::new(item.uri.clone(), item.range),
+        });
+        self.symbols_by_selection.insert(selection, node);
+        node
     }
 
-    fn add_relation(&mut self, source: NodeIndex, target: NodeIndex, relation: Relation) {
+    fn add_relation(
+        &mut self,
+        source: NodeIndex,
+        target: NodeIndex,
+        relation: Relation,
+    ) -> Result<()> {
+        if relation == Relation::Contains {
+            if source == target {
+                bail!("symbol {} contains itself", self.graph[source].name);
+            }
+            if self.graph[source].location.uri != self.graph[target].location.uri {
+                bail!(
+                    "containment between {:?} and {:?} crosses files",
+                    self.graph[source].name,
+                    self.graph[target].name
+                );
+            }
+            let parent = self
+                .graph
+                .edges_directed(target, Direction::Incoming)
+                .find(|edge| *edge.weight() == Relation::Contains)
+                .map(|edge| edge.source());
+            if let Some(parent) = parent
+                && parent != source
+            {
+                bail!(
+                    "symbol {:?} has multiple containment parents: {:?} and {:?}",
+                    self.graph[target].name,
+                    self.graph[parent].name,
+                    self.graph[source].name
+                );
+            }
+
+            let mut ancestor = source;
+            loop {
+                if ancestor == target {
+                    bail!(
+                        "containment relationship between {:?} and {:?} is cyclic",
+                        self.graph[source].name,
+                        self.graph[target].name
+                    );
+                }
+                let Some(parent) = self
+                    .graph
+                    .edges_directed(ancestor, Direction::Incoming)
+                    .find(|edge| *edge.weight() == Relation::Contains)
+                    .map(|edge| edge.source())
+                else {
+                    break;
+                };
+                ancestor = parent;
+            }
+        }
+
         if !self
             .graph
             .edges_connecting(source, target)
@@ -360,6 +433,7 @@ impl WorkspaceGraph {
         {
             self.graph.add_edge(source, target, relation);
         }
+        Ok(())
     }
 
     fn enclosing_unit(&self, uri: &Url, position: Position) -> Option<NodeIndex> {
@@ -491,23 +565,16 @@ fn document_range(text: &str) -> Range {
     Range::new(Position::new(0, 0), Position::new(line, character))
 }
 
-async fn prepare_call_hierarchy(
-    server: &mut ServerSocket,
+async fn wait_for_call_hierarchy(
+    server: &ServerSocket,
     params: &CallHierarchyPrepareParams,
-    wait_for_item: bool,
 ) -> async_lsp::Result<Option<Vec<CallHierarchyItem>>> {
     for attempt in 0..READY_ATTEMPTS {
-        match server.prepare_call_hierarchy(params.clone()).await {
-            Ok(items)
-                if wait_for_item
-                    && items.as_ref().is_none_or(Vec::is_empty)
-                    && attempt + 1 < READY_ATTEMPTS =>
-            {
-                tokio::time::sleep(READY_RETRY_DELAY).await;
-            }
-            Err(LspError::Response(error))
-                if error.code == ErrorCode::CONTENT_MODIFIED && attempt + 1 < READY_ATTEMPTS =>
-            {
+        match retry_request::<CallHierarchyPrepare>(server, params).await {
+            Ok(items) if items.as_ref().is_none_or(Vec::is_empty) => {
+                if attempt + 1 == READY_ATTEMPTS {
+                    return Ok(items);
+                }
                 tokio::time::sleep(READY_RETRY_DELAY).await;
             }
             result => return result,
@@ -538,6 +605,14 @@ where
 mod tests {
     use super::*;
 
+    fn add_node(workspace: &mut WorkspaceGraph, uri: &Url, name: &str) -> NodeIndex {
+        workspace.graph.add_node(Node {
+            name: name.into(),
+            kind: NodeKind::Struct,
+            location: Location::new(uri.clone(), Range::default()),
+        })
+    }
+
     #[test]
     fn accepts_empty_flat_symbol_response() {
         let mut workspace = WorkspaceGraph::default();
@@ -546,5 +621,62 @@ mod tests {
         workspace
             .add_symbols(&uri, Some(DocumentSymbolResponse::Flat(Vec::new())))
             .unwrap();
+    }
+
+    #[test]
+    fn deduplicates_relationships() {
+        let mut workspace = WorkspaceGraph::default();
+        let uri = Url::parse("file:///test.rs").unwrap();
+        let parent = add_node(&mut workspace, &uri, "parent");
+        let child = add_node(&mut workspace, &uri, "child");
+
+        workspace
+            .add_relation(parent, child, Relation::Contains)
+            .unwrap();
+        workspace
+            .add_relation(parent, child, Relation::Contains)
+            .unwrap();
+
+        assert_eq!(workspace.graph.edge_count(), 1);
+    }
+
+    #[test]
+    fn rejects_multiple_containment_parents_during_analysis() {
+        let mut workspace = WorkspaceGraph::default();
+        let uri = Url::parse("file:///test.rs").unwrap();
+        let first_parent = add_node(&mut workspace, &uri, "first");
+        let second_parent = add_node(&mut workspace, &uri, "second");
+        let child = add_node(&mut workspace, &uri, "child");
+
+        workspace
+            .add_relation(first_parent, child, Relation::Contains)
+            .unwrap();
+        let error = workspace
+            .add_relation(second_parent, child, Relation::Contains)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("multiple containment parents"));
+    }
+
+    #[test]
+    fn rejects_symbols_with_the_same_selection() {
+        let mut workspace = WorkspaceGraph::default();
+        let selection = Location::new(
+            Url::parse("file:///test.rs").unwrap(),
+            Range::new(Position::new(1, 2), Position::new(1, 3)),
+        );
+        let symbol = |name: &str| Node {
+            name: name.into(),
+            kind: NodeKind::Function,
+            location: selection.clone(),
+        };
+
+        workspace
+            .add_symbol(selection.clone(), symbol("first"))
+            .unwrap();
+        let second = symbol("second");
+        let error = workspace.add_symbol(selection, second).unwrap_err();
+
+        assert!(error.to_string().contains("share selection"));
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::Path;
 
@@ -8,21 +8,25 @@ use super::{ExportNode, Snapshot, canonical_root, display_uri};
 use crate::graph::{Graph, NodeKind, Relation};
 
 struct Forest {
+    file_nodes: HashMap<usize, usize>,
     parents: HashMap<usize, usize>,
     children: HashMap<usize, Vec<usize>>,
 }
 
 impl Forest {
     fn new(snapshot: &Snapshot<'_>) -> Self {
-        let mut parents = HashMap::new();
-        for edge in &snapshot.edges {
-            if edge.relation == Relation::Contains {
-                parents
-                    .entry(edge.target)
-                    .and_modify(|parent: &mut usize| *parent = (*parent).min(edge.source))
-                    .or_insert(edge.source);
-            }
-        }
+        let file_nodes = snapshot
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::File)
+            .map(|node| (node.file, node.id))
+            .collect();
+        let parents = snapshot
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == Relation::Contains)
+            .map(|edge| (edge.target, edge.source))
+            .collect();
 
         let mut children: HashMap<_, Vec<_>> = HashMap::new();
         for (&child, &parent) in &parents {
@@ -32,13 +36,17 @@ impl Forest {
             children.sort_unstable();
         }
 
-        Self { parents, children }
+        Self {
+            file_nodes,
+            parents,
+            children,
+        }
     }
 }
 
 pub fn write_compact(graph: &Graph, root: &Path, mut output: impl Write) -> Result<()> {
     let root = canonical_root(root)?;
-    let snapshot = Snapshot::new(graph);
+    let snapshot = Snapshot::new(graph)?;
     let forest = Forest::new(&snapshot);
     writeln!(output, "plexus/1 positions=utf-16,zero-based")?;
     write_files(&snapshot, &forest, &root, &mut output)?;
@@ -51,7 +59,6 @@ fn write_files(
     root: &Path,
     mut output: impl Write,
 ) -> Result<()> {
-    let mut visited = HashSet::new();
     for (file, uri) in snapshot.files.iter().enumerate() {
         let nodes: Vec<_> = snapshot
             .nodes
@@ -59,10 +66,7 @@ fn write_files(
             .filter(|node| node.file == file)
             .map(|node| node.id)
             .collect();
-        let file_node = nodes
-            .iter()
-            .copied()
-            .find(|&id| snapshot.nodes[id].kind == NodeKind::File);
+        let file_node = forest.file_nodes.get(&file).copied();
 
         write!(output, "\n@")?;
         match file_node {
@@ -74,17 +78,12 @@ fn write_files(
         writeln!(output)?;
 
         for &id in &nodes {
-            let nested = forest
+            let root = forest
                 .parents
                 .get(&id)
-                .is_some_and(|parent| Some(*parent) != file_node);
-            if Some(id) != file_node && !nested {
-                write_tree(snapshot, forest, id, 0, &mut visited, &mut output)?;
-            }
-        }
-        for id in nodes {
-            if Some(id) != file_node && !visited.contains(&id) {
-                write_tree(snapshot, forest, id, 0, &mut visited, &mut output)?;
+                .is_none_or(|parent| Some(*parent) == file_node);
+            if Some(id) != file_node && root {
+                write_tree(snapshot, forest, id, 0, &mut output)?;
             }
         }
     }
@@ -96,13 +95,8 @@ fn write_tree<W: Write + ?Sized>(
     forest: &Forest,
     id: usize,
     depth: usize,
-    visited: &mut HashSet<usize>,
     output: &mut W,
 ) -> Result<()> {
-    if !visited.insert(id) {
-        return Ok(());
-    }
-
     for _ in 0..depth {
         write!(output, "  ")?;
     }
@@ -119,7 +113,7 @@ fn write_tree<W: Write + ?Sized>(
 
     if let Some(children) = forest.children.get(&id) {
         for &child in children {
-            write_tree(snapshot, forest, child, depth + 1, visited, output)?;
+            write_tree(snapshot, forest, child, depth + 1, output)?;
         }
     }
     Ok(())
@@ -140,7 +134,7 @@ fn write_relations(snapshot: &Snapshot<'_>, mut output: impl Write) -> Result<()
             continue;
         }
 
-        writeln!(output, "\n{}", relation.name())?;
+        writeln!(output, "\n{}", relation.as_str())?;
         for (source, targets) in adjacency {
             write!(output, "{source}:")?;
             for (index, target) in targets.into_iter().enumerate() {
@@ -179,12 +173,26 @@ fn write_escaped<W: Write + ?Sized>(output: &mut W, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_lsp::lsp_types::{Location, Position, Range};
+    use petgraph::graph::NodeIndex;
+
+    fn node(graph: &Graph, name: &str, kind: NodeKind) -> NodeIndex {
+        graph
+            .node_indices()
+            .find(|&node| graph[node].name == name && graph[node].kind == kind)
+            .unwrap()
+    }
+
+    fn render(graph: &Graph, root: &Path) -> Result<Vec<u8>> {
+        let mut output = Vec::new();
+        write_compact(graph, root, &mut output)?;
+        Ok(output)
+    }
 
     #[test]
     fn writes_compact_graph() {
         let (graph, root) = super::super::test_graph();
-        let mut output = Vec::new();
-        write_compact(&graph, &root, &mut output).unwrap();
+        let output = render(&graph, &root).unwrap();
 
         let expected = r#"plexus/1 positions=utf-16,zero-based
 
@@ -201,5 +209,52 @@ reads
 3:2
 "#;
         assert_eq!(String::from_utf8(output).unwrap(), expected);
+    }
+
+    #[test]
+    fn rejects_multiple_containment_parents() {
+        let (mut graph, root) = super::super::test_graph();
+        let function = node(&graph, "run", NodeKind::Function);
+        let field = node(&graph, "value", NodeKind::Field);
+        graph.add_edge(function, field, Relation::Contains);
+
+        let error = render(&graph, &root).unwrap_err();
+        assert!(error.to_string().contains("multiple containment parents"));
+    }
+
+    #[test]
+    fn rejects_containment_cycles() {
+        let (mut graph, root) = super::super::test_graph();
+        let file = node(&graph, "example.rs", NodeKind::File);
+        let uri = graph[file].location.uri.clone();
+        let first = graph.add_node(crate::graph::Node {
+            name: "first".into(),
+            kind: NodeKind::Module,
+            location: Location::new(
+                uri.clone(),
+                Range::new(Position::new(11, 0), Position::new(12, 0)),
+            ),
+        });
+        let second = graph.add_node(crate::graph::Node {
+            name: "second".into(),
+            kind: NodeKind::Module,
+            location: Location::new(uri, Range::new(Position::new(13, 0), Position::new(14, 0))),
+        });
+        graph.add_edge(first, second, Relation::Contains);
+        graph.add_edge(second, first, Relation::Contains);
+
+        let error = render(&graph, &root).unwrap_err();
+        assert!(error.to_string().contains("cyclic"));
+    }
+
+    #[test]
+    fn rejects_a_parent_for_the_file_node() {
+        let (mut graph, root) = super::super::test_graph();
+        let file = node(&graph, "example.rs", NodeKind::File);
+        let field = node(&graph, "value", NodeKind::Field);
+        graph.add_edge(field, file, Relation::Contains);
+
+        let error = render(&graph, &root).unwrap_err();
+        assert!(error.to_string().contains("file node"));
     }
 }
