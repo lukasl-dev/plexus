@@ -1,7 +1,3 @@
-.zig-cache/
-zig-out/
-*.o
-zig-pkg/
+/target/
 result
 .direnv/
-std
