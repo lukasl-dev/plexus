@@ -5,6 +5,9 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
+anyhow = "1"
+async-process = "2"
 async-lsp = "0.2.4"
 clap = { version = "4.6.6", features = ["derive"] }
 petgraph = "0.8.3"
+tokio = { version = "1", features = ["macros", "rt", "time"] }
