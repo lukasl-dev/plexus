@@ -6,3 +6,4 @@ license = "MIT"
 
 [dependencies]
 async-lsp = "0.2.4"
+clap = { version = "4.6.6", features = ["derive"] }
